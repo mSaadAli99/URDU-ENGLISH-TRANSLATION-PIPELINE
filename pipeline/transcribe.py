@@ -30,7 +30,8 @@ from pipeline.utils import (
     save_json, get_interview_id, format_timestamp,
     print_banner, now_str,
     collapse_repetitions, merge_short_segments, is_urdu_text,
-    is_clearly_english, is_possible_roman_urdu,
+    is_clearly_english, is_possible_roman_urdu, is_likely_native_english,
+    should_translate_segment,
     calibrate_confidence, score_text_quality,
 )
 
@@ -112,7 +113,7 @@ def _whisper_seg_to_dict(seg, default_language="unknown"):
         "avg_logprob"   : round(getattr(seg, "avg_logprob", -1.0), 4),
         "no_speech_prob": round(getattr(seg, "no_speech_prob", 0.0), 4),
         "language"      : seg_lang,
-        "is_urdu"       : is_urdu_text(text),
+        "is_urdu"       : should_translate_segment(text),
         "words"         : [
             {
                 "word"      : w.word,
@@ -125,44 +126,51 @@ def _whisper_seg_to_dict(seg, default_language="unknown"):
     }
 
 
-def _classify_pass2_action(seg: dict, global_language: Optional[str]) -> str:
+def _classify_pass2_action(
+    seg: dict,
+    global_language: Optional[str],
+    aggressive: bool = False,
+) -> str:
     """
     Decide whether to keep pass-1 text or re-transcribe as Urdu or English.
 
+    Latin script does NOT mean English — Roman Urdu must be re-tried with language=ur.
     Returns 'keep', 'ur', or 'en'.
     """
     text = seg.get("text", "")
     lang = (seg.get("language") or "unknown").lower()
-    conf = seg.get("confidence", 0.0)
 
     if is_urdu_text(text):
         return "keep"
 
-    if is_clearly_english(text) and conf >= config.CONFIDENCE_THRESHOLD:
-        if lang in ("en", "english"):
-            return "keep"
-        if lang == "unknown" and not is_possible_roman_urdu(text):
-            return "keep"
+    if is_likely_native_english(text) and lang in ("en", "english"):
+        return "keep"
+
+    if is_likely_native_english(text) and lang == "unknown" and not aggressive:
+        return "keep"
 
     if lang == "ur" or is_possible_roman_urdu(text):
         return "ur"
 
-    if conf < config.CONFIDENCE_THRESHOLD:
-        if lang in ("unknown", "ur"):
-            return "ur"
-        if lang == "en":
-            return "en"
-        if global_language == "ur":
-            return "ur"
+    if not is_likely_native_english(text):
         return "ur"
 
-    if lang == "en" and not is_clearly_english(text):
+    if aggressive:
+        return "ur"
+
+    if lang == "en" and not is_likely_native_english(text):
         return "en"
 
-    if lang == "unknown" and global_language == "en" and is_clearly_english(text):
-        return "keep"
+    if seg.get("confidence", 0.0) < config.CONFIDENCE_THRESHOLD:
+        return "ur" if global_language != "en" else "en"
 
     return "keep"
+
+
+def _refresh_urdu_flags(segments: list) -> None:
+    """Recompute is_urdu from final text (script + Roman Urdu heuristics)."""
+    for seg in segments:
+        seg["is_urdu"] = should_translate_segment(seg.get("text", ""))
 
 
 def _is_pass2_better(old_seg: dict, new_text: str, new_meta: dict, target_lang: str) -> bool:
@@ -229,47 +237,79 @@ def _retranscribe_clip(model, audio_path: str, start: float, end: float, languag
         "text_quality"  : score_text_quality(combined),
         "avg_logprob"   : round(getattr(last_seg, "avg_logprob", -1.0), 4),
         "language"      : language,
-        "is_urdu"       : is_urdu_text(combined),
+        "is_urdu"       : is_urdu_text(combined) or should_translate_segment(combined),
     }
+
+
+def _retry_segment(model, audio_path: str, seg: dict, action: str, stats: dict, label: str):
+    """Re-transcribe one segment and apply if pass-2 output is better."""
+    stats[f"retranscribed_{action}"] += 1
+    new_text, new_meta = _retranscribe_clip(
+        model, audio_path, seg["start"], seg["end"], action,
+    )
+
+    if _is_pass2_better(seg, new_text, new_meta, action):
+        seg["text"] = new_text
+        seg["language"] = new_meta.get("language", action)
+        seg["is_urdu"] = new_meta.get("is_urdu", should_translate_segment(new_text))
+        seg["confidence"] = new_meta.get("confidence", seg["confidence"])
+        seg["raw_confidence"] = new_meta.get("raw_confidence", seg["raw_confidence"])
+        seg["text_quality"] = new_meta.get("text_quality", seg["text_quality"])
+        seg["avg_logprob"] = new_meta.get("avg_logprob", seg["avg_logprob"])
+        seg["pass2_action"] = f"{label}_improved_{action}"
+        stats[f"improved_{action}"] += 1
+    else:
+        seg["pass2_action"] = f"{label}_kept_pass1_over_{action}"
 
 
 def _apply_two_pass(model, audio_path: str, segments: list, info) -> tuple[list, dict]:
     """Pass 2: re-transcribe doubtful segments with forced Urdu or English."""
     global_lang = getattr(info, "language", None)
     stats = {
-        "enabled"           : True,
-        "retranscribed_ur"  : 0,
-        "retranscribed_en"  : 0,
-        "kept_pass1"        : 0,
-        "improved_ur"       : 0,
-        "improved_en"       : 0,
+        "enabled"              : True,
+        "detected_language"    : global_lang,
+        "retranscribed_ur"     : 0,
+        "retranscribed_en"     : 0,
+        "kept_pass1"           : 0,
+        "improved_ur"          : 0,
+        "improved_en"          : 0,
+        "aggressive_fallback"  : False,
     }
 
-    print("\n  Pass 2: re-transcribing doubtful segments ...")
+    print(f"\n  Pass 2: re-transcribing doubtful segments (detected lang: {global_lang}) ...")
+    retry_count = 0
     for seg in segments:
-        action = _classify_pass2_action(seg, global_lang)
+        action = _classify_pass2_action(seg, global_lang, aggressive=False)
         if action == "keep":
             seg["pass2_action"] = "keep"
             stats["kept_pass1"] += 1
             continue
 
-        stats[f"retranscribed_{action}"] += 1
-        new_text, new_meta = _retranscribe_clip(
-            model, audio_path, seg["start"], seg["end"], action,
-        )
+        _retry_segment(model, audio_path, seg, action, stats, "p2")
+        retry_count += 1
+        if retry_count % config.WHISPER_PASS2_PROGRESS_EVERY == 0:
+            print(f"    ... pass 2 progress: {retry_count} retries done")
 
-        if _is_pass2_better(seg, new_text, new_meta, action):
-            seg["text"] = new_text
-            seg["language"] = new_meta.get("language", action)
-            seg["is_urdu"] = new_meta.get("is_urdu", is_urdu_text(new_text))
-            seg["confidence"] = new_meta.get("confidence", seg["confidence"])
-            seg["raw_confidence"] = new_meta.get("raw_confidence", seg["raw_confidence"])
-            seg["text_quality"] = new_meta.get("text_quality", seg["text_quality"])
-            seg["avg_logprob"] = new_meta.get("avg_logprob", seg["avg_logprob"])
-            seg["pass2_action"] = f"improved_{action}"
-            stats[f"improved_{action}"] += 1
-        else:
-            seg["pass2_action"] = f"kept_pass1_over_{action}"
+    _refresh_urdu_flags(segments)
+    urdu_script_count = sum(1 for s in segments if is_urdu_text(s["text"]))
+
+    if config.WHISPER_PASS2_AGGRESSIVE_FALLBACK and urdu_script_count == 0:
+        stats["aggressive_fallback"] = True
+        print(
+            "\n  Pass 2b: no Urdu script found — aggressive Urdu retry on "
+            "all non-English segments ..."
+        )
+        retry_count = 0
+        for seg in segments:
+            if is_urdu_text(seg["text"]) or is_likely_native_english(seg["text"]):
+                continue
+            if seg.get("pass2_action", "").endswith("_improved_ur"):
+                continue
+            _retry_segment(model, audio_path, seg, "ur", stats, "p2b")
+            retry_count += 1
+            if retry_count % config.WHISPER_PASS2_PROGRESS_EVERY == 0:
+                print(f"    ... pass 2b progress: {retry_count} retries done")
+        _refresh_urdu_flags(segments)
 
     print(
         f"  Pass 2 summary: "
@@ -277,6 +317,8 @@ def _apply_two_pass(model, audio_path: str, segments: list, info) -> tuple[list,
         f"{stats['retranscribed_en']} English retries ({stats['improved_en']} improved), "
         f"{stats['kept_pass1']} kept from pass 1"
     )
+    if stats["aggressive_fallback"]:
+        print("  Pass 2b aggressive fallback was applied.")
     return segments, stats
 
 
@@ -308,7 +350,7 @@ def transcribe(audio_path: str) -> dict:
     print(f"  Audio file   : {audio_path}")
     print(f"  Model        : whisper-{config.WHISPER_MODEL}")
     print(f"  Language     : {lang_display}")
-    print(f"  Two-pass ASR : {'on' if two_pass_enabled else 'off'}")
+    print(f"  Two-pass ASR : {'on' if two_pass_enabled else 'off'}  (v2)")
     print(f"  Device       : {config.WHISPER_DEVICE}")
     print(f"  Temperature  : {temp_display}")
     print(f"  Beam size    : {config.WHISPER_BEAM_SIZE}")
@@ -362,6 +404,8 @@ def transcribe(audio_path: str) -> dict:
     pass2_stats = {"enabled": False}
     if two_pass_enabled and segments:
         segments, pass2_stats = _apply_two_pass(model, audio_path, segments, info)
+    else:
+        _refresh_urdu_flags(segments)
 
     for i, seg in enumerate(segments, start=1):
         seg["segment_id"] = i
@@ -369,6 +413,7 @@ def transcribe(audio_path: str) -> dict:
             seg["pass2_action"] = "n/a"
 
     urdu_count    = sum(1 for s in segments if s["is_urdu"])
+    urdu_script   = sum(1 for s in segments if is_urdu_text(s["text"]))
     english_count = len(segments) - urdu_count
     avg_conf      = (
         sum(s["confidence"] for s in segments) / len(segments)
@@ -392,7 +437,8 @@ def transcribe(audio_path: str) -> dict:
 
     print(f"\n  Results:")
     print(f"  Segments total    : {len(segments)}")
-    print(f"    Urdu            : {urdu_count}")
+    print(f"    Urdu (routed)   : {urdu_count}")
+    print(f"    Urdu (script)   : {urdu_script}")
     print(f"    English         : {english_count}")
     print(f"    Low confidence  : {low_conf_count}  (threshold={config.CONFIDENCE_THRESHOLD})")
     print(f"  Avg raw confidence: {avg_raw_conf:.3f}")
@@ -426,6 +472,7 @@ def transcribe(audio_path: str) -> dict:
         "duration_minutes"   : round(duration_seconds / 60, 2),
         "total_segments"     : len(segments),
         "urdu_segments"      : urdu_count,
+        "urdu_script_segments": urdu_script,
         "english_segments"   : english_count,
         "avg_raw_confidence" : round(avg_raw_conf, 4),
         "avg_confidence"     : round(avg_conf, 4),

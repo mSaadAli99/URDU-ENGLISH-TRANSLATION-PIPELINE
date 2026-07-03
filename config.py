@@ -60,6 +60,10 @@ WHISPER_PASS2_PROMPT_EN = (
 )
 # Minimum confidence gain required to replace pass-1 text with pass-2 text
 WHISPER_PASS2_CONFIDENCE_MARGIN = 0.05
+# If pass 2 still finds zero Urdu-script segments, retry all non-English segments
+WHISPER_PASS2_AGGRESSIVE_FALLBACK = True
+# Log pass-2 progress every N segment retries (long interviews)
+WHISPER_PASS2_PROGRESS_EVERY = 25
 
 # Auto-detect GPU; fall back to CPU gracefully
 try:

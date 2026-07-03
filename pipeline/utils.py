@@ -175,6 +175,35 @@ _ROMAN_URDU_HINTS = frozenset({
     "assalam", "alaikum", "salam", "ji", "han", "haan", "ap", "apka",
     "apki", "apke", "mujhe", "tujhe", "usko", "isko", "unko", "hoga",
     "hogi", "honge", "raha", "rahi", "rahe", "gaya", "gayi", "gaye",
+    "kia", "karte", "karti", "karna", "karni", "karo", "karein",
+    "gaya", "gaye", "gayi", "raha", "rahi", "rahe", "tha", "thi", "the",
+    "walaykum", "khawateen", "shukriya", "bhai", "behen", "allah",
+    "inshallah", "mashallah", "zaroor", "bilkul", "achha", "theek",
+    "samajh", "samjha", "samjhi", "lagta", "lagti", "lagte", "dekho",
+    "dekha", "sunna", "suno", "bolo", "bolna", "kaho", "kahiye",
+})
+
+_URDU_SUBSTRINGS = (
+    "alaikum", "salam", "assalam", "shukriya", "khuda", "allah",
+    "inshallah", "mashallah", "khawateen", "walaykum", "bilkul",
+    "zaroor", "theek hai", "samajh", "mashwara",
+)
+
+_ENGLISH_HINTS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "must", "can", "i", "you", "he", "she", "it",
+    "we", "they", "my", "your", "his", "her", "our", "their", "this", "that",
+    "these", "those", "what", "which", "who", "when", "where", "why", "how",
+    "all", "each", "every", "both", "some", "such", "not", "only", "than",
+    "too", "very", "just", "because", "but", "and", "or", "if", "while",
+    "of", "at", "by", "for", "with", "about", "from", "into", "through",
+    "during", "before", "after", "over", "under", "again", "then", "once",
+    "here", "there", "also", "even", "well", "way", "many", "much", "new",
+    "know", "think", "look", "want", "give", "use", "find", "tell", "ask",
+    "work", "seem", "feel", "try", "come", "take", "see", "get", "make",
+    "like", "going", "really", "actually", "obviously", "definitely",
+    "professor", "university", "research", "engineering", "technology",
 })
 
 
@@ -192,15 +221,45 @@ def is_clearly_english(text: str, threshold: float = 0.80) -> bool:
     return latin / len(letters) >= threshold
 
 
-def is_possible_roman_urdu(text: str, word_ratio: float = 0.15, min_hits: int = 2) -> bool:
+def is_possible_roman_urdu(text: str, word_ratio: float = 0.12, min_hits: int = 1) -> bool:
     """Heuristic for Urdu spoken but written in Latin script by Whisper."""
     if is_urdu_text(text):
         return True
-    words = re.findall(r"[a-zA-Z']+", text.lower())
+    lower = text.lower()
+    if any(sub in lower for sub in _URDU_SUBSTRINGS):
+        return True
+    words = re.findall(r"[a-zA-Z']+", lower)
     if not words:
         return False
     hits = sum(1 for w in words if w in _ROMAN_URDU_HINTS)
     return hits >= min_hits or (hits / len(words)) >= word_ratio
+
+
+def is_likely_native_english(text: str, min_ratio: float = 0.10, min_hits: int = 3) -> bool:
+    """
+    True when a Latin-script segment reads like spoken English.
+    Latin letters alone are NOT enough — Roman Urdu also uses Latin script.
+    """
+    if is_urdu_text(text):
+        return False
+    if is_possible_roman_urdu(text):
+        return False
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    if len(words) < 4:
+        return False
+    hits = sum(1 for w in words if w in _ENGLISH_HINTS)
+    return hits >= min_hits and (hits / len(words)) >= min_ratio
+
+
+def should_translate_segment(text: str, is_urdu_flag: bool = False) -> bool:
+    """Whether Stage 3 should translate this segment (Urdu content -> English)."""
+    if is_urdu_flag:
+        return True
+    if is_urdu_text(text):
+        return True
+    if is_likely_native_english(text):
+        return False
+    return is_possible_roman_urdu(text)
 
 
 def collapse_repetitions(segments: list, max_consecutive: int = 3) -> list:

@@ -8,7 +8,8 @@ import os
 import sys
 from pipeline.utils import (
     save_json, split_sentences, chunk_sentences,
-    fix_translation_errors, is_urdu_text, print_banner, now_str,
+    fix_translation_errors, is_urdu_text, should_translate_segment,
+    print_banner, now_str,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,7 +50,7 @@ def translate(stage2_result: dict) -> dict:
 
     for i, seg in enumerate(verified_segments):
         # Prefer the is_urdu flag from Stage 1; fall back to text analysis
-        if seg.get("is_urdu", is_urdu_text(seg["text"])):
+        if should_translate_segment(seg["text"], seg.get("is_urdu", False)):
             urdu_indices.append(i)
             urdu_texts.append(seg["text"])
 

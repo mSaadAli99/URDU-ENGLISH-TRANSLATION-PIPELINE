@@ -48,6 +48,19 @@ WHISPER_MERGE_MIN_WORDS    = 4     # words — merge if word count is also below
 # Whisper sometimes loops the same phrase; collapse runs longer than this
 REPETITION_MAX_CONSECUTIVE = 3   # Flag a segment if same text appeared N+ times in a row
 
+# ── Stage 1: Two-pass ASR (code-switched Urdu/English) ───────
+# Pass 1: auto-detect on full audio. Pass 2: re-transcribe doubtful segments
+# with language="ur" or language="en". Only applies when WHISPER_LANGUAGE is None.
+WHISPER_TWO_PASS = True
+WHISPER_PASS2_PROMPT_UR = (
+    "Transcribe spoken Urdu in Urdu script using Arabic letters."
+)
+WHISPER_PASS2_PROMPT_EN = (
+    "Transcribe spoken English in Latin script."
+)
+# Minimum confidence gain required to replace pass-1 text with pass-2 text
+WHISPER_PASS2_CONFIDENCE_MARGIN = 0.05
+
 # Auto-detect GPU; fall back to CPU gracefully
 try:
     import torch as _torch

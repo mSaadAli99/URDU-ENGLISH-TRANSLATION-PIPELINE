@@ -164,6 +164,45 @@ def is_urdu_text(text: str, threshold: float = 0.25) -> bool:
     return urdu_chars / len(text.strip()) >= threshold
 
 
+_ROMAN_URDU_HINTS = frozenset({
+    "main", "mein", "hai", "hain", "ho", "tha", "thi", "the",
+    "yeh", "ye", "woh", "wo", "kya", "ka", "ki", "ke", "ko", "se", "par",
+    "aur", "bhi", "nahi", "nahin", "toh", "to", "jab", "tab", "agar",
+    "kyun", "kyunki", "lekin", "magar", "phir", "ab", "ya",
+    "hum", "tum", "aap", "unka", "unki", "unke", "mera", "meri", "mere",
+    "aik", "ek", "do", "teen", "bahut", "zyada", "kam", "sab", "kuch",
+    "kaha", "kahin", "yahan", "wahan", "abhi", "pehle", "baad",
+    "assalam", "alaikum", "salam", "ji", "han", "haan", "ap", "apka",
+    "apki", "apke", "mujhe", "tujhe", "usko", "isko", "unko", "hoga",
+    "hogi", "honge", "raha", "rahi", "rahe", "gaya", "gayi", "gaye",
+})
+
+
+def is_clearly_english(text: str, threshold: float = 0.80) -> bool:
+    """Return True when text is predominantly Latin-script English."""
+    if is_urdu_text(text):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return True
+    letters = [c for c in stripped if c.isalpha()]
+    if not letters:
+        return True
+    latin = sum(1 for c in letters if c.isascii())
+    return latin / len(letters) >= threshold
+
+
+def is_possible_roman_urdu(text: str, word_ratio: float = 0.15, min_hits: int = 2) -> bool:
+    """Heuristic for Urdu spoken but written in Latin script by Whisper."""
+    if is_urdu_text(text):
+        return True
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    if not words:
+        return False
+    hits = sum(1 for w in words if w in _ROMAN_URDU_HINTS)
+    return hits >= min_hits or (hits / len(words)) >= word_ratio
+
+
 def collapse_repetitions(segments: list, max_consecutive: int = 3) -> list:
     """
     Remove Whisper hallucination loops where the same phrase repeats back-to-back.

@@ -17,16 +17,20 @@
 #   5. Dual confidence scoring    — per-word probability is combined
 #      with the segment-level avg_logprob to produce a more robust
 #      confidence estimate.
+#   6. Two-pass ASR               — doubtful segments are re-transcribed
+#      with language="ur" or language="en" for code-switched interviews.
 # ============================================================
 
 import os
 import sys
 import math
+from typing import Optional
 
 from pipeline.utils import (
     save_json, get_interview_id, format_timestamp,
     print_banner, now_str,
     collapse_repetitions, merge_short_segments, is_urdu_text,
+    is_clearly_english, is_possible_roman_urdu,
     calibrate_confidence, score_text_quality,
 )
 
@@ -59,12 +63,221 @@ def _compute_confidence(seg) -> float:
     if seg.words:
         probs = [w.probability for w in seg.words if hasattr(w, "probability")]
         word_conf = sum(probs) / len(probs) if probs else logprob_conf
-        # 90 % word-level + 10 % segment logprob as a sanity floor.
-        # Logprob is harsher (includes token generation cost) and would
-        # unfairly penalise short conversational speech if weighted higher.
         return round(0.90 * word_conf + 0.10 * logprob_conf, 4)
 
     return logprob_conf
+
+
+def _build_transcribe_kwargs(language=None, initial_prompt=None, vad_filter=True):
+    """Shared faster-whisper kwargs for pass 1 and pass 2."""
+    kwargs = dict(
+        temperature=config.WHISPER_TEMPERATURE,
+        no_speech_threshold=config.WHISPER_NO_SPEECH_THRESHOLD,
+        compression_ratio_threshold=config.WHISPER_COMPRESSION_RATIO_THRESHOLD,
+        log_prob_threshold=config.WHISPER_LOG_PROB_THRESHOLD,
+        word_timestamps=True,
+        beam_size=config.WHISPER_BEAM_SIZE,
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt or config.WHISPER_INITIAL_PROMPT,
+        vad_filter=vad_filter,
+    )
+    if vad_filter:
+        kwargs["vad_parameters"] = dict(
+            min_silence_duration_ms=700,
+            speech_pad_ms=200,
+        )
+    if language is not None:
+        kwargs["language"] = language
+    elif config.WHISPER_LANGUAGE is not None:
+        kwargs["language"] = config.WHISPER_LANGUAGE
+    return kwargs
+
+
+def _whisper_seg_to_dict(seg, default_language="unknown"):
+    """Convert a faster-whisper segment object to our pipeline dict."""
+    conf = _compute_confidence(seg)
+    seg_lang = getattr(seg, "language", None) or default_language
+    text = seg.text.strip()
+
+    return {
+        "segment_id"    : seg.id,
+        "start"         : round(seg.start, 3),
+        "end"           : round(seg.end, 3),
+        "start_fmt"     : format_timestamp(seg.start),
+        "end_fmt"       : format_timestamp(seg.end),
+        "text"          : text,
+        "raw_confidence": conf,
+        "confidence"    : calibrate_confidence(conf),
+        "text_quality"  : score_text_quality(text),
+        "avg_logprob"   : round(getattr(seg, "avg_logprob", -1.0), 4),
+        "no_speech_prob": round(getattr(seg, "no_speech_prob", 0.0), 4),
+        "language"      : seg_lang,
+        "is_urdu"       : is_urdu_text(text),
+        "words"         : [
+            {
+                "word"      : w.word,
+                "start"     : round(w.start, 3),
+                "end"       : round(w.end, 3),
+                "confidence": round(w.probability, 4) if hasattr(w, "probability") else None,
+            }
+            for w in (seg.words or [])
+        ],
+    }
+
+
+def _classify_pass2_action(seg: dict, global_language: Optional[str]) -> str:
+    """
+    Decide whether to keep pass-1 text or re-transcribe as Urdu or English.
+
+    Returns 'keep', 'ur', or 'en'.
+    """
+    text = seg.get("text", "")
+    lang = (seg.get("language") or "unknown").lower()
+    conf = seg.get("confidence", 0.0)
+
+    if is_urdu_text(text):
+        return "keep"
+
+    if is_clearly_english(text) and conf >= config.CONFIDENCE_THRESHOLD:
+        if lang in ("en", "english"):
+            return "keep"
+        if lang == "unknown" and not is_possible_roman_urdu(text):
+            return "keep"
+
+    if lang == "ur" or is_possible_roman_urdu(text):
+        return "ur"
+
+    if conf < config.CONFIDENCE_THRESHOLD:
+        if lang in ("unknown", "ur"):
+            return "ur"
+        if lang == "en":
+            return "en"
+        if global_language == "ur":
+            return "ur"
+        return "ur"
+
+    if lang == "en" and not is_clearly_english(text):
+        return "en"
+
+    if lang == "unknown" and global_language == "en" and is_clearly_english(text):
+        return "keep"
+
+    return "keep"
+
+
+def _is_pass2_better(old_seg: dict, new_text: str, new_meta: dict, target_lang: str) -> bool:
+    """Return True when pass-2 output should replace pass-1 for this segment."""
+    if not new_text.strip():
+        return False
+
+    margin = config.WHISPER_PASS2_CONFIDENCE_MARGIN
+    old_conf = old_seg.get("confidence", 0.0)
+    new_conf = new_meta.get("confidence", 0.0)
+    old_text = old_seg.get("text", "")
+
+    if target_lang == "ur":
+        if is_urdu_text(new_text) and not is_urdu_text(old_text):
+            return True
+        if is_urdu_text(new_text) and is_urdu_text(old_text):
+            return new_conf >= old_conf - margin
+        if is_possible_roman_urdu(new_text) and not is_possible_roman_urdu(old_text):
+            return new_conf >= old_conf - margin
+        return new_conf > old_conf + margin
+
+    if is_urdu_text(old_text) and is_clearly_english(new_text):
+        return True
+    if is_clearly_english(new_text):
+        return new_conf >= old_conf - margin
+    return new_conf > old_conf + margin
+
+
+def _retranscribe_clip(model, audio_path: str, start: float, end: float, language: str):
+    """Re-transcribe a single time range with a forced language."""
+    prompt = (
+        config.WHISPER_PASS2_PROMPT_UR
+        if language == "ur"
+        else config.WHISPER_PASS2_PROMPT_EN
+    )
+    kwargs = _build_transcribe_kwargs(
+        language=language,
+        initial_prompt=prompt,
+        vad_filter=False,
+    )
+    kwargs["clip_timestamps"] = [start, end]
+
+    segments_iter, _ = model.transcribe(audio_path, **kwargs)
+
+    texts = []
+    last_seg = None
+    for seg in segments_iter:
+        text = seg.text.strip()
+        if text:
+            texts.append(text)
+            last_seg = seg
+
+    if not texts:
+        return "", {}
+
+    combined = " ".join(texts).strip()
+    if last_seg is None:
+        return combined, {}
+
+    conf = _compute_confidence(last_seg)
+    return combined, {
+        "confidence"    : calibrate_confidence(conf),
+        "raw_confidence": conf,
+        "text_quality"  : score_text_quality(combined),
+        "avg_logprob"   : round(getattr(last_seg, "avg_logprob", -1.0), 4),
+        "language"      : language,
+        "is_urdu"       : is_urdu_text(combined),
+    }
+
+
+def _apply_two_pass(model, audio_path: str, segments: list, info) -> tuple[list, dict]:
+    """Pass 2: re-transcribe doubtful segments with forced Urdu or English."""
+    global_lang = getattr(info, "language", None)
+    stats = {
+        "enabled"           : True,
+        "retranscribed_ur"  : 0,
+        "retranscribed_en"  : 0,
+        "kept_pass1"        : 0,
+        "improved_ur"       : 0,
+        "improved_en"       : 0,
+    }
+
+    print("\n  Pass 2: re-transcribing doubtful segments ...")
+    for seg in segments:
+        action = _classify_pass2_action(seg, global_lang)
+        if action == "keep":
+            seg["pass2_action"] = "keep"
+            stats["kept_pass1"] += 1
+            continue
+
+        stats[f"retranscribed_{action}"] += 1
+        new_text, new_meta = _retranscribe_clip(
+            model, audio_path, seg["start"], seg["end"], action,
+        )
+
+        if _is_pass2_better(seg, new_text, new_meta, action):
+            seg["text"] = new_text
+            seg["language"] = new_meta.get("language", action)
+            seg["is_urdu"] = new_meta.get("is_urdu", is_urdu_text(new_text))
+            seg["confidence"] = new_meta.get("confidence", seg["confidence"])
+            seg["raw_confidence"] = new_meta.get("raw_confidence", seg["raw_confidence"])
+            seg["text_quality"] = new_meta.get("text_quality", seg["text_quality"])
+            seg["avg_logprob"] = new_meta.get("avg_logprob", seg["avg_logprob"])
+            seg["pass2_action"] = f"improved_{action}"
+            stats[f"improved_{action}"] += 1
+        else:
+            seg["pass2_action"] = f"kept_pass1_over_{action}"
+
+    print(
+        f"  Pass 2 summary: "
+        f"{stats['retranscribed_ur']} Urdu retries ({stats['improved_ur']} improved), "
+        f"{stats['retranscribed_en']} English retries ({stats['improved_en']} improved), "
+        f"{stats['kept_pass1']} kept from pass 1"
+    )
+    return segments, stats
 
 
 # ── Main entry point ──────────────────────────────────────────
@@ -73,9 +286,9 @@ def transcribe(audio_path: str) -> dict:
     """
     Stage 1: Transcribe audio using faster-whisper.
 
-    Language is auto-detected per segment when config.WHISPER_LANGUAGE
-    is None — the correct setting for code-switched Urdu/English
-    interviews.  All five quality improvements are applied in sequence.
+    When WHISPER_TWO_PASS is enabled and language is auto-detect:
+      Pass 1 — full-audio auto-detect transcription
+      Pass 2 — doubtful segments re-transcribed with language="ur" or "en"
     """
     print_banner(1, "TRANSCRIPTION (ASR)")
 
@@ -83,6 +296,10 @@ def transcribe(audio_path: str) -> dict:
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     lang_display = config.WHISPER_LANGUAGE or "auto-detect"
+    two_pass_enabled = (
+        config.WHISPER_TWO_PASS
+        and config.WHISPER_LANGUAGE is None
+    )
     temp_display = (
         config.WHISPER_TEMPERATURE
         if isinstance(config.WHISPER_TEMPERATURE, (int, float))
@@ -91,6 +308,7 @@ def transcribe(audio_path: str) -> dict:
     print(f"  Audio file   : {audio_path}")
     print(f"  Model        : whisper-{config.WHISPER_MODEL}")
     print(f"  Language     : {lang_display}")
+    print(f"  Two-pass ASR : {'on' if two_pass_enabled else 'off'}")
     print(f"  Device       : {config.WHISPER_DEVICE}")
     print(f"  Temperature  : {temp_display}")
     print(f"  Beam size    : {config.WHISPER_BEAM_SIZE}")
@@ -113,71 +331,19 @@ def transcribe(audio_path: str) -> dict:
     )
     print("  Model loaded.")
 
-    # ── Build transcription kwargs ────────────────────────────
-    transcribe_kwargs = dict(
-        # Improvement 1: temperature fallback list
-        temperature=config.WHISPER_TEMPERATURE,
-        # Improvement 2: quality decode thresholds
-        no_speech_threshold=config.WHISPER_NO_SPEECH_THRESHOLD,
-        compression_ratio_threshold=config.WHISPER_COMPRESSION_RATIO_THRESHOLD,
-        log_prob_threshold=config.WHISPER_LOG_PROB_THRESHOLD,
-        # Core settings
-        word_timestamps=True,
-        beam_size=config.WHISPER_BEAM_SIZE,
-        condition_on_previous_text=False,   # prevents cascading hallucinations
-        initial_prompt=config.WHISPER_INITIAL_PROMPT,
-        # Improvement 3: larger VAD silence window reduces micro-fragmentation
-        vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=700,    # was 500 — fewer micro-segments
-            speech_pad_ms=200,              # pad each detected speech chunk
-        ),
-    )
+    transcribe_kwargs = _build_transcribe_kwargs()
 
-    if config.WHISPER_LANGUAGE is not None:
-        transcribe_kwargs["language"] = config.WHISPER_LANGUAGE
-
-    print(f"\n  Transcribing audio (language: {lang_display}) ...")
+    print(f"\n  Pass 1: transcribing audio (language: {lang_display}) ...")
     segments_iter, info = model.transcribe(audio_path, **transcribe_kwargs)
 
-    # ── Collect raw segments ──────────────────────────────────
     raw_segments = []
     for seg in segments_iter:
-        # Improvement 5: dual confidence scoring
-        conf = _compute_confidence(seg)
-
         seg_lang = getattr(seg, "language", None) or config.WHISPER_LANGUAGE or "unknown"
-
-        text = seg.text.strip()
-        raw_segments.append({
-            "segment_id"    : seg.id,
-            "start"         : round(seg.start, 3),
-            "end"           : round(seg.end, 3),
-            "start_fmt"     : format_timestamp(seg.start),
-            "end_fmt"       : format_timestamp(seg.end),
-            "text"          : text,
-            "raw_confidence": conf,                          # uncalibrated Whisper score
-            "confidence"    : calibrate_confidence(conf),   # calibrated (accuracy-representative)
-            "text_quality"  : score_text_quality(text),     # linguistic quality 0-1
-            "avg_logprob"   : round(getattr(seg, "avg_logprob", -1.0), 4),
-            "no_speech_prob": round(getattr(seg, "no_speech_prob", 0.0), 4),
-            "language"      : seg_lang,
-            "is_urdu"       : is_urdu_text(text),
-            "words"         : [
-                {
-                    "word"      : w.word,
-                    "start"     : round(w.start, 3),
-                    "end"       : round(w.end, 3),
-                    "confidence": round(w.probability, 4) if hasattr(w, "probability") else None,
-                }
-                for w in (seg.words or [])
-            ],
-        })  # end raw_segments.append
+        raw_segments.append(_whisper_seg_to_dict(seg, default_language=seg_lang))
 
     raw_count = len(raw_segments)
     print(f"  Raw segments from Whisper: {raw_count}")
 
-    # ── Improvement 4: merge micro-segments ───────────────────
     merged_segments = merge_short_segments(
         raw_segments,
         min_duration=config.WHISPER_MERGE_MIN_DURATION,
@@ -187,18 +353,21 @@ def transcribe(audio_path: str) -> dict:
     if merged_count:
         print(f"  Merged {merged_count} micro-segments into neighbours.")
 
-    # ── Collapse Whisper hallucination loops ──────────────────
     before_filter = len(merged_segments)
     segments = collapse_repetitions(merged_segments, max_consecutive=config.REPETITION_MAX_CONSECUTIVE)
     removed_loops = before_filter - len(segments)
     if removed_loops:
         print(f"  Collapsed {removed_loops} repeated hallucination segments.")
 
-    # Re-number after filtering
+    pass2_stats = {"enabled": False}
+    if two_pass_enabled and segments:
+        segments, pass2_stats = _apply_two_pass(model, audio_path, segments, info)
+
     for i, seg in enumerate(segments, start=1):
         seg["segment_id"] = i
+        if "pass2_action" not in seg:
+            seg["pass2_action"] = "n/a"
 
-    # ── Language breakdown ────────────────────────────────────
     urdu_count    = sum(1 for s in segments if s["is_urdu"])
     english_count = len(segments) - urdu_count
     avg_conf      = (
@@ -237,9 +406,10 @@ def transcribe(audio_path: str) -> dict:
         flag = "!" if seg["confidence"] < config.CONFIDENCE_THRESHOLD else " "
         lang = "UR" if seg["is_urdu"] else "EN"
         mrg  = "[M]" if seg.get("merged") else "   "
+        p2   = seg.get("pass2_action", "")
         print(
             f"    [{flag}][{lang}]{mrg} {seg['start_fmt']} -> {seg['end_fmt']} "
-            f"| conf={seg['confidence']:.3f} | {seg['text'][:55]}"
+            f"| conf={seg['confidence']:.3f} | {p2:18s} | {seg['text'][:45]}"
         )
 
     result = {
@@ -251,6 +421,7 @@ def transcribe(audio_path: str) -> dict:
         "processed_at"       : now_str(),
         "model"              : f"whisper-{config.WHISPER_MODEL}",
         "language_mode"      : lang_display,
+        "two_pass_asr"       : pass2_stats,
         "duration_seconds"   : round(duration_seconds, 2),
         "duration_minutes"   : round(duration_seconds / 60, 2),
         "total_segments"     : len(segments),

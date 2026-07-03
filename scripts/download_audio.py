@@ -5,7 +5,7 @@ scripts/download_audio.py — Download a sample Urdu audio clip from YouTube.
 Usage:
     python scripts/download_audio.py                        # download default sample
     python scripts/download_audio.py --url URL              # custom YouTube URL
-    python scripts/download_audio.py --url URL --start 137 --duration 720
+    python scripts/download_audio.py --url URL --start 137 --duration 3300
 
 Requirements:
     pip install yt-dlp
@@ -20,7 +20,7 @@ import sys
 
 DEFAULT_URL      = "https://youtu.be/pHZHYWe8Mkc"
 DEFAULT_START    = 137      # seconds into the video
-DEFAULT_DURATION = 720      # seconds to keep (12 min)
+DEFAULT_DURATION = 3300     # seconds to keep (55 min)
 OUTPUT_FILE      = "audio/test_audio.mp3"
 FULL_FILE        = "audio/full.mp3"
 

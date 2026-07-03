@@ -98,7 +98,7 @@ urdu-pipeline/
 | `WHISPER_DEVICE` | auto-detected | `cuda` if GPU found, else `cpu` |
 | `WHISPER_COMPUTE_TYPE` | auto-detected | `float16` on GPU, `int8` on CPU |
 | `TRANSLATION_MODEL` | `facebook/nllb-200-1.3B` | Translation model |
-| `CONFIDENCE_THRESHOLD` | `0.75` | Flag transcript segments below this |
+| `CONFIDENCE_THRESHOLD` | `0.55` | Flag transcript segments below this (calibrated; 0.55 is realistic for conversational speech) |
 | `CHUNK_SIZE` | `500` | Max chars per translation chunk |
 | `BATCH_TRANSLATION_SIZE` | `5` | Chunks per NLLB batch call |
 

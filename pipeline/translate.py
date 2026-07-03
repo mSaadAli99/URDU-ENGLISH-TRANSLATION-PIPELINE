@@ -32,7 +32,7 @@ def translate(stage2_result: dict) -> dict:
     except ImportError:
         raise ImportError("transformers / torch not installed. Run: pip install transformers torch")
 
-    use_cuda   = torch.cuda.is_available()
+    use_cuda   = config.WHISPER_DEVICE == "cuda" and torch.cuda.is_available()
     model_name = config.TRANSLATION_MODEL if use_cuda else config.CPU_TRANSLATION_MODEL
     is_nllb    = "nllb" in model_name.lower()
 
@@ -40,46 +40,6 @@ def translate(stage2_result: dict) -> dict:
     print(f"  Interview ID   : {interview_id}")
     print(f"  Model          : {model_name}")
     print(f"  Routing        : Urdu→NLLB  |  English→pass-through")
-    print(f"\n  Loading translation model ({size_hint} first run)...")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model_    = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-
-    device = "cpu"
-    if use_cuda:
-        model_ = model_.half().to("cuda")
-        device = "cuda"
-    model_.eval()
-    print(f"  ✔ Model loaded on {device}.")
-
-    tgt_lang_id = tokenizer.convert_tokens_to_ids(config.NLLB_TGT_LANG) if is_nllb else None
-
-    # ── Batch translate a list of text strings ────────────────
-    def _translate_batch(texts: list) -> list:
-        inputs = tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
-        ).to(device)
-
-        gen_kwargs = dict(
-            max_new_tokens=256,
-            num_beams=3 if device == "cpu" else 5,
-            early_stopping=True,
-        )
-        if tgt_lang_id is not None:
-            gen_kwargs["forced_bos_token_id"] = tgt_lang_id
-
-        with torch.no_grad():
-            outputs = model_.generate(**inputs, **gen_kwargs)
-
-        return [
-            fix_translation_errors(t)
-            for t in tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        ]
-
     # ── Partition segments by language ───────────────────────
     verified_segments = stage2_result["verified_segments"]
     total             = len(verified_segments)
@@ -94,24 +54,67 @@ def translate(stage2_result: dict) -> dict:
             urdu_texts.append(seg["text"])
 
     english_count = total - len(urdu_indices)
-    print(f"\n  Routing: {len(urdu_indices)} Urdu segments → translate  |  "
-          f"{english_count} English segments → pass-through")
+    print(f"\n  Routing: {len(urdu_indices)} Urdu segments -> translate  |  "
+          f"{english_count} English segments -> pass-through")
 
-    # ── Batch translate all Urdu segments ─────────────────────
-    print(f"\n  Translating Urdu segments...")
+    # ── Early-exit optimisation: no Urdu segments → skip model load ──
     translated_urdu: dict = {}   # index → translated text
-    batch_size = max(config.BATCH_TRANSLATION_SIZE, 8)
 
-    for start in range(0, len(urdu_indices), batch_size):
-        batch_idx   = urdu_indices[start : start + batch_size]
-        batch_texts = urdu_texts[start : start + batch_size]
-        try:
-            results = _translate_batch(batch_texts)
-        except Exception as e:
-            print(f"    ⚠ Batch failed: {e}")
-            results = ["[TRANSLATION ERROR]"] * len(batch_texts)
-        for idx, eng in zip(batch_idx, results):
-            translated_urdu[idx] = eng
+    if not urdu_indices:
+        print("\n  [opt] All segments are English — skipping translation model load.")
+    else:
+        # Only load the model when there is actually something to translate
+        print(f"\n  Loading translation model ({size_hint} first run)...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        device    = "cuda" if use_cuda else "cpu"
+        dtype     = torch.float16 if use_cuda else torch.float32
+        model_    = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name, torch_dtype=dtype, low_cpu_mem_usage=True,
+        ).to(device)
+        model_.eval()
+        print(f"  Model loaded on {device}.")
+
+        tgt_lang_id = tokenizer.convert_tokens_to_ids(config.NLLB_TGT_LANG) if is_nllb else None
+
+        def _translate_batch(texts: list) -> list:
+            inputs = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(device)
+
+            gen_kwargs = dict(
+                max_new_tokens=256,
+                num_beams=3 if device == "cpu" else 5,
+                early_stopping=True,
+            )
+            if tgt_lang_id is not None:
+                gen_kwargs["forced_bos_token_id"] = tgt_lang_id
+
+            with torch.no_grad():
+                outputs = model_.generate(**inputs, **gen_kwargs)
+
+            return [
+                fix_translation_errors(t)
+                for t in tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            ]
+
+        # ── Batch translate all Urdu segments ─────────────────
+        print(f"\n  Translating Urdu segments...")
+        batch_size = config.BATCH_TRANSLATION_SIZE
+
+        for start in range(0, len(urdu_indices), batch_size):
+            batch_idx   = urdu_indices[start : start + batch_size]
+            batch_texts = urdu_texts[start : start + batch_size]
+            try:
+                results = _translate_batch(batch_texts)
+            except Exception as e:
+                print(f"    Batch failed: {e}")
+                results = ["[TRANSLATION ERROR]"] * len(batch_texts)
+            for idx, eng in zip(batch_idx, results):
+                translated_urdu[idx] = eng
 
     # ── Assemble final segment list ───────────────────────────
     print(f"\n  Assembling translated segments:")

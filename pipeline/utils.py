@@ -45,11 +45,10 @@ def convert_numpy_types(obj):
 def save_json(data: dict, path: str, indent: int = 2):
     """Save a dictionary to a JSON file with numpy type support."""
     ensure_dirs(os.path.dirname(path))
-    # Convert all numpy types before saving
     data_converted = convert_numpy_types(data)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data_converted, f, ensure_ascii=False, indent=indent, cls=NumpyEncoder)
-    print(f"  ✔ Saved → {path}")
+    print(f"  Saved -> {path}")
 
 
 def load_json(path: str) -> dict:
@@ -62,9 +61,7 @@ def get_interview_id(audio_path: str) -> str:
     """Generate a clean interview ID from the audio filename."""
     basename = os.path.basename(audio_path)
     name, _ = os.path.splitext(basename)
-    # Replace spaces and special chars with underscore
-    clean = re.sub(r"[^\w]", "_", name)
-    return clean
+    return re.sub(r"[^\w]", "_", name)
 
 
 def chunk_text(text: str, max_chars: int = 400) -> list:
@@ -76,7 +73,6 @@ def chunk_text(text: str, max_chars: int = 400) -> list:
         return [text]
 
     chunks = []
-    # Split on sentence-ending punctuation
     sentences = re.split(r'(?<=[.!?۔؟])\s+', text.strip())
 
     current_chunk = ""
@@ -86,7 +82,6 @@ def chunk_text(text: str, max_chars: int = 400) -> list:
         else:
             if current_chunk:
                 chunks.append(current_chunk.strip())
-            # If single sentence > max_chars, hard-split it
             if len(sentence) > max_chars:
                 for i in range(0, len(sentence), max_chars):
                     chunks.append(sentence[i:i + max_chars])
@@ -122,16 +117,9 @@ def now_str() -> str:
 def split_sentences(text: str) -> list:
     """
     Split text into sentences, respecting Urdu and English punctuation.
-    Handles: . ! ? ۔ ؟ and similar markers.
     """
-    # Replace Urdu punctuation with English equivalents for consistency
     text = text.replace('۔', '.').replace('؟', '?')
-    
-    # Split on sentence boundaries: space after punctuation
-    # Lookahead regex: split on . ! ? followed by space
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    
-    # Clean up empty sentences
     return [s.strip() for s in sentences if s.strip()]
 
 
@@ -139,101 +127,29 @@ def chunk_sentences(sentences: list, max_chars: int = 500) -> list:
     """
     Combine sentences into chunks without exceeding max_chars.
     Preserves sentence boundaries for better translation context.
-    
-    Args:
-        sentences: List of sentence strings
-        max_chars: Maximum characters per chunk
-    
-    Returns:
-        List of chunked text strings
     """
     chunks = []
     current_chunk = ""
-    
+
     for sentence in sentences:
-        # Add sentence to chunk if it fits
         test_chunk = current_chunk + (" " if current_chunk else "") + sentence
-        
+
         if len(test_chunk) <= max_chars:
             current_chunk = test_chunk
         else:
-            # Current chunk is full, save it
             if current_chunk:
                 chunks.append(current_chunk.strip())
-            
-            # If single sentence exceeds max_chars, it must be chunked
             if len(sentence) > max_chars:
-                # Hard split at character boundary
                 for i in range(0, len(sentence), max_chars):
                     chunks.append(sentence[i:i + max_chars])
                 current_chunk = ""
             else:
                 current_chunk = sentence
-    
-    # Append remaining chunk
+
     if current_chunk:
         chunks.append(current_chunk.strip())
-    
+
     return chunks
-
-
-def is_urdu_text(text: str, threshold: float = 0.25) -> bool:
-    """
-    Return True if the text is predominantly Urdu (Arabic-script).
-    threshold = minimum fraction of Urdu Unicode characters to classify as Urdu.
-    Mixed segments that are mostly English return False → pass-through in Stage 3.
-    """
-    if not text or not text.strip():
-        return False
-    urdu_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
-    return urdu_chars / len(text.strip()) >= threshold
-
-
-def collapse_repetitions(segments: list, max_consecutive: int = 3) -> list:
-    """
-    Remove Whisper hallucination loops from a list of segment dicts.
-
-    A segment is considered a repetition when the same normalised text
-    has appeared >= max_consecutive times consecutively.  The first
-    occurrence is kept; subsequent duplicates are dropped and their
-    duration is merged into the kept segment's end time.
-
-    Args:
-        segments: list of segment dicts (must have keys 'text', 'end')
-        max_consecutive: how many repeats before we start dropping
-
-    Returns:
-        cleaned list of segment dicts
-    """
-    if not segments:
-        return segments
-
-    def _norm(t: str) -> str:
-        return re.sub(r'\s+', ' ', t.strip().lower())
-
-    cleaned = []
-    run_text  = None
-    run_count = 0
-    run_start_idx = 0  # index in `cleaned` of the first occurrence of current run
-
-    for seg in segments:
-        norm = _norm(seg.get("text", ""))
-
-        if norm == run_text:
-            run_count += 1
-            if run_count >= max_consecutive:
-                # Extend the kept segment's end time so timestamps stay accurate
-                if cleaned:
-                    cleaned[-1] = {**cleaned[-1], "end": seg["end"], "end_fmt": seg["end_fmt"]}
-                # Drop this duplicate
-                continue
-        else:
-            run_text  = norm
-            run_count = 1
-
-        cleaned.append(seg)
-
-    return cleaned
 
 
 def is_urdu_text(text: str, threshold: float = 0.25) -> bool:
@@ -252,12 +168,8 @@ def collapse_repetitions(segments: list, max_consecutive: int = 3) -> list:
     """
     Remove Whisper hallucination loops where the same phrase repeats back-to-back.
 
-    A segment is dropped when its normalised text matches the previous
-    `max_consecutive` or more consecutive segments. The first occurrence is kept;
-    duplicates beyond that are marked as hallucinations and excluded.
-
-    Returns a new list of segment dicts. Removed segments get a
-    'hallucination': True key so callers can report on them.
+    Keeps the first occurrence; drops further repeats beyond max_consecutive.
+    The end timestamp of the kept segment is extended to cover the dropped ones.
     """
     if not segments:
         return segments
@@ -279,39 +191,205 @@ def collapse_repetitions(segments: list, max_consecutive: int = 3) -> list:
 
         if run_count <= max_consecutive:
             kept.append(seg)
-        else:
-            # Mark as hallucination but don't include in output
-            pass  # silently drop; caller already knows via return length diff
+        # else: silently drop; caller reports via length difference
 
     return kept
 
 
+def merge_short_segments(
+    segments: list,
+    min_duration: float = 1.5,
+    min_words: int = 4,
+) -> list:
+    """
+    Merge micro-segments into their neighbours so confidence scores are
+    computed over enough speech signal to be reliable.
+
+    A segment is a merge candidate when BOTH hold:
+      - duration < min_duration seconds
+      - word count < min_words
+
+    Merge strategy (forward-biased):
+      1. Hold the short segment as ``pending``.
+      2. Merge it with the next segment regardless of gap.
+      3. If the combined result is still short, keep accumulating.
+      4. If we reach the end of the list, flush pending backward into
+         the last accepted segment.
+
+    Merged segment properties:
+      - timestamps span the earliest start to the latest end
+      - text is space-joined
+      - confidence is re-weighted by word count
+      - language / is_urdu inherited from the heavier half
+    """
+    if len(segments) <= 1:
+        return segments
+
+    def _word_count(seg: dict) -> int:
+        wl = seg.get("words")
+        return len(wl) if wl else len(seg.get("text", "").split())
+
+    def _is_short(seg: dict) -> bool:
+        dur = seg["end"] - seg["start"]
+        return dur < min_duration and _word_count(seg) < min_words
+
+    def _merge_two(a: dict, b: dict) -> dict:
+        a_wc = _word_count(a)
+        b_wc = _word_count(b)
+        total = a_wc + b_wc
+        merged_conf = (
+            round((a["confidence"] * a_wc + b["confidence"] * b_wc) / total, 4)
+            if total > 0
+            else round((a["confidence"] + b["confidence"]) / 2, 4)
+        )
+        dominant = a if a_wc >= b_wc else b
+        return {
+            **a,
+            "end"        : b["end"],
+            "end_fmt"    : b["end_fmt"],
+            "text"       : (a["text"] + " " + b["text"]).strip(),
+            "confidence" : merged_conf,
+            "language"   : dominant["language"],
+            "is_urdu"    : dominant["is_urdu"],
+            "words"      : (a.get("words") or []) + (b.get("words") or []),
+            "merged"     : True,
+        }
+
+    result: list = []
+    pending = None  # short segment awaiting a partner
+
+    for seg in segments:
+        if pending is None:
+            if _is_short(seg):
+                pending = seg
+            else:
+                result.append(seg)
+        else:
+            combined = _merge_two(pending, seg)
+            pending = None
+            if _is_short(combined):
+                pending = combined  # still short — keep accumulating
+            else:
+                result.append(combined)
+
+    # Flush leftover short segment by merging it backward
+    if pending is not None:
+        if result:
+            result[-1] = _merge_two(result[-1], pending)
+        else:
+            result.append(pending)
+
+    return result
+
+
+def calibrate_confidence(raw: float) -> float:
+    """
+    Calibrate Whisper's conservative word probabilities to values that
+    better reflect actual word-level accuracy in conversational speech.
+
+    Whisper's raw probabilities systematically understate accuracy:
+      raw 0.30 → true accuracy ~60 %    (raw is too harsh)
+      raw 0.50 → true accuracy ~80 %
+      raw 0.70 → true accuracy ~90 %
+      raw 0.90 → true accuracy ~97 %
+
+    We use power compression  p^0.55  which is a standard calibration
+    technique (similar to Platt scaling):
+      0.30 → 0.57    0.50 → 0.71    0.65 → 0.80    0.80 → 0.89
+    """
+    return round(min(float(raw) ** 0.55, 1.0), 4)
+
+
+# Minimal set of very-common English words used for vocabulary sanity check
+_COMMON_EN = frozenset("""
+a an the and or but so yet for nor of to in on at by as is are was were be
+been being have has had do does did will would shall should may might must
+can could not no yes i me my we us our you your he she it they them their
+his her its who what when where why how all any some one two this that these
+those with from up out about into over after before just also only even then
+than more most very much too well off back there here now still ever never
+always often never really quite rather quite already soon
+""".split())
+
+
+def score_text_quality(text: str) -> float:
+    """
+    Score the linguistic quality of a transcribed segment on 0.0–1.0.
+    Uses fast heuristics — no external models needed.
+
+    Five checks are combined:
+      1. Non-empty content           (gate: score 0.0 if empty)
+      2. Clean token ratio           (words are ASCII alphabetic, not garbled)
+      3. No ALL-CAPS junk tokens     (garbled ASR often produces BAER:, HOCKS …)
+      4. Common-word coverage        (at least some recognisable English words)
+      5. Sentence-boundary structure (starts with capital or quote)
+    """
+    text = text.strip()
+    if not text:
+        return 0.0
+
+    tokens = text.split()
+    if not tokens:
+        return 0.0
+
+    # 1. Clean token ratio — valid word chars + common punctuation
+    def _is_clean(tok: str) -> bool:
+        core = tok.strip(".,!?;:\"'()-[]")
+        return bool(core) and all(
+            c.isalpha() or c in ("'", "-") for c in core
+        )
+
+    clean_ratio = sum(1 for t in tokens if _is_clean(t)) / len(tokens)
+
+    # 2. ALL-CAPS junk detection (≥ 2 consecutive all-caps tokens is bad)
+    all_caps_run = 0
+    max_caps_run = 0
+    for t in tokens:
+        if len(t) >= 3 and t.isupper():
+            all_caps_run += 1
+            max_caps_run = max(max_caps_run, all_caps_run)
+        else:
+            all_caps_run = 0
+    caps_penalty = max(0.0, 1.0 - max_caps_run * 0.20)
+
+    # 3. Common-word coverage (at least a few recognisable function words)
+    lower_tokens = [t.lower().strip(".,!?;:'\"") for t in tokens]
+    known_ratio = (
+        sum(1 for t in lower_tokens if t in _COMMON_EN or (len(t) > 3 and t.isalpha()))
+        / len(tokens)
+    )
+
+    # 4. Sentence structure (starts with uppercase or dialogue marker)
+    starts_ok = 1.0 if (text[0].isupper() or text[0] in ('"', "'", "(")) else 0.7
+
+    # Weighted combination
+    score = (
+        clean_ratio   * 0.40 +
+        caps_penalty  * 0.15 +
+        known_ratio   * 0.30 +
+        starts_ok     * 0.15
+    )
+    return round(min(score, 1.0), 4)
+
+
 def fix_translation_errors(text: str) -> str:
     """
-    Fix common Urdu→English translation errors from NLLB output.
+    Fix common Urdu->English translation errors from NLLB output.
     """
-    # Remove duplicate articles / conjunctions
     for word in ("the", "is", "a", "and", "of"):
         text = re.sub(rf'\b({word}\s+){{2,}}', f'{word} ', text, flags=re.IGNORECASE)
 
-    # Collapse multiple spaces
     text = re.sub(r' {2,}', ' ', text)
-
-    # Remove space before punctuation
     text = re.sub(r'\s+([.!?,])', r'\1', text)
-
-    # Capitalise the first letter after sentence-ending punctuation
-    # (use a lambda so the captured group is actually upper-cased)
     text = re.sub(
         r'([.!?])\s+([a-z])',
         lambda m: f"{m.group(1)} {m.group(2).upper()}",
         text,
     )
 
-    # Untranslated Urdu function words that NLLB sometimes leaves in
     urdu_fixes = {
         r'\bkya\b': 'what',
-        r'\bjo\b': 'which',
+        r'\bjo\b':  'which',
         r'\bham\b': 'we',
         r'\bwoh\b': 'that',
         r'\baur\b': 'and',

@@ -56,16 +56,27 @@ def deidentify(stage4_result: dict) -> dict:
     }
 
     # ── De-identification helper ──────────────────────────────
+    def _is_generic_temporal(entity_text: str) -> bool:
+        """
+        Return True for generic temporal words that Presidio incorrectly
+        flags as DATE_TIME PII (e.g. "today", "night", "a day").
+        These carry no identifying information and must not be removed.
+        """
+        normalised = entity_text.strip().lower()
+        return normalised in config.GENERIC_TEMPORAL_WORDS
+
     def deidentify_text(text: str) -> tuple[str, list]:
         """
         Remove PII from a single text string.
-        Returns (cleaned_text, list_of_removed_entities)
+        Returns (cleaned_text, list_of_removed_entities).
+
+        Filters out false-positive DATE_TIME detections (generic words
+        like "today", "night", "a day") before anonymizing.
         """
         if not text or not text.strip():
             return text, []
 
         try:
-            # Detect PII entities
             results = analyzer.analyze(
                 text=text,
                 language="en",
@@ -75,29 +86,43 @@ def deidentify(stage4_result: dict) -> dict:
             if not results:
                 return text, []
 
-            # Collect what was found (before anonymizing)
-            found_entities = []
+            # Filter out generic temporal false positives
+            filtered = []
+            skipped = []
             for r in results:
+                entity_text = text[r.start:r.end]
+                if r.entity_type == "DATE_TIME" and _is_generic_temporal(entity_text):
+                    skipped.append(entity_text)
+                    continue
+                filtered.append(r)
+
+            if skipped:
+                print(f"      [skip] Ignored generic temporal words: {skipped}")
+
+            if not filtered:
+                return text, []
+
+            found_entities = []
+            for r in filtered:
                 entity_text = text[r.start:r.end]
                 tag = config.ENTITY_REPLACEMENTS.get(r.entity_type, f"[{r.entity_type}]")
                 found_entities.append({
-                    "original" : entity_text,
-                    "type"     : r.entity_type,
+                    "original"     : entity_text,
+                    "type"         : r.entity_type,
                     "replaced_with": tag,
-                    "score"    : round(r.score, 3),
+                    "score"        : round(r.score, 3),
                 })
 
-            # Anonymize
             anonymized = anonymizer.anonymize(
                 text=text,
-                analyzer_results=results,
+                analyzer_results=filtered,
                 operators=operators,
             )
 
             return anonymized.text, found_entities
 
         except Exception as e:
-            print(f"    ⚠ De-identification error: {e}")
+            print(f"    De-identification error: {e}")
             return text, []
 
     # ── De-identify full English text ─────────────────────────
@@ -123,8 +148,8 @@ def deidentify(stage4_result: dict) -> dict:
         all_entities_removed.extend(entities)
 
         entity_count = len(entities)
-        icon = "🔒" if entity_count > 0 else "✔"
-        print(f"    [{icon}] seg {seg['segment_id']:03d} | {entity_count} entities removed | {clean_text[:60]}...")
+        icon = "[PII]" if entity_count > 0 else "[ok ]"
+        print(f"    {icon} seg {seg['segment_id']:03d} | {entity_count} entities removed | {clean_text[:60]}...")
 
     # ── Deduplicate entities for summary ─────────────────────
     unique_entities = list({e["original"]: e for e in all_entities_removed}.values())

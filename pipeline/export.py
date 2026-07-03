@@ -53,8 +53,11 @@ def export(stage5_result: dict) -> dict:
         "translation_quality_score"     : stage5_result["translation_quality_score"],
 
         # ── Text at each stage ────────────────────────
-        "urdu_transcript"               : stage5_result["urdu_full_text"],
-        "verified_urdu_transcript"      : stage5_result.get("verified_urdu_full", ""),
+        # "original_transcript" holds the raw ASR output in whichever language
+        # was spoken (Urdu, English, or mixed). For English interviews this is
+        # already English; for Urdu interviews it is Urdu text.
+        "original_transcript"           : stage5_result["urdu_full_text"],
+        "verified_original_transcript"  : stage5_result.get("verified_urdu_full", ""),
         "english_translation"           : stage5_result["english_full_text"],
         "verified_english_translation"  : stage5_result["verified_english_full"],
         "deidentified_english"          : stage5_result["deidentified_english_full"],
@@ -171,15 +174,17 @@ def _build_docx(data: dict, interview_id: str) -> str:
     for cell in meta_table.rows[0].cells:
         cell.paragraphs[0].runs[0].bold = True
 
+    tq_label = data.get("transcript_verification_report", {}).get("quality_label", "")
+    tlq_label = data.get("translation_verification_report", {}).get("quality_label", "")
     meta_fields = [
-        ("Interview ID",             data["interview_id"]),
-        ("Audio File",               data["audio_filename"]),
-        ("Duration (minutes)",       data["duration_minutes"]),
-        ("Processing Date",          data["processing_date"][:10]),
-        ("Transcript Quality Score", f"{data['transcript_quality_score']}/100"),
-        ("Translation Quality Score",f"{data['translation_quality_score']}/100"),
-        ("Entities Removed",         data["entities_removed_count"]),
-        ("Flagged Segments",         len(data["flagged_segments"])),
+        ("Interview ID",              data["interview_id"]),
+        ("Audio File",                data["audio_filename"]),
+        ("Duration (minutes)",        data["duration_minutes"]),
+        ("Processing Date",           data["processing_date"][:10]),
+        ("Transcript Quality Score",  f"{data['transcript_quality_score']}/100  ({tq_label})"),
+        ("Translation Quality Score", f"{data['translation_quality_score']}/100  ({tlq_label})"),
+        ("Entities Removed",          data["entities_removed_count"]),
+        ("Flagged Segments (total)",  len(data["flagged_segments"])),
     ]
     for k, v in meta_fields:
         add_kv_row(meta_table, k, v)
@@ -189,13 +194,13 @@ def _build_docx(data: dict, interview_id: str) -> str:
     # ════════════════════════════════════════════════════════
     # SECTION 2: VERIFIED URDU TRANSCRIPT
     # ════════════════════════════════════════════════════════
-    add_heading("2. Verified Urdu Transcript", level=1)
+    add_heading("2. Original Transcript", level=1)
     doc.add_paragraph(
-        "Original Urdu transcription with low-confidence segments marked as [LOW CONFIDENCE]."
+        "Original transcription (ASR output). Low-confidence segments are marked [LOW CONFIDENCE]."
     ).italic = True
 
     urdu_para = doc.add_paragraph()
-    urdu_para.add_run(data.get("verified_urdu_transcript", data["urdu_transcript"]))
+    urdu_para.add_run(data.get("verified_original_transcript", data["original_transcript"]))
 
     doc.add_page_break()
 
@@ -275,14 +280,21 @@ def _build_docx(data: dict, interview_id: str) -> str:
     tr_table.style = "Light Shading Accent 1"
     tr_table.rows[0].cells[0].text = "Metric"
     tr_table.rows[0].cells[1].text = "Value"
+    # avg_calibrated_conf is the current key; avg_confidence kept for backwards compat
+    avg_conf_val = tr.get("avg_calibrated_conf", tr.get("avg_confidence", ""))
     tr_fields = [
-        ("Total Segments",      tr.get("total_segments", "")),
-        ("Good Segments",       tr.get("good_segments", "")),
-        ("Flagged Segments",    tr.get("flagged_segments", "")),
-        ("Avg Confidence",      tr.get("avg_confidence", "")),
-        ("Quality Score",       f"{tr.get('quality_score', '')}/100"),
-        ("Quality Label",       tr.get("quality_label", "")),
-        ("Duration Covered",    f"{tr.get('duration_covered_min', '')} min"),
+        ("Total Segments",           tr.get("total_segments", "")),
+        ("Good Segments",            tr.get("good_segments", "")),
+        ("Flagged Segments",         tr.get("flagged_segments", "")),
+        ("Avg Calibrated Confidence",avg_conf_val),
+        ("Avg Text Quality",         tr.get("avg_text_quality", "")),
+        ("Coverage (% good segs)",   f"{round(tr.get('pct_good_segments', 0)*100, 1)} %"),
+        ("Cleanliness Score",        tr.get("cleanliness_score", "")),
+        ("Quality Score",            f"{tr.get('quality_score', '')}/100"),
+        ("Quality Label",            tr.get("quality_label", "")),
+        ("Duration Covered",         f"{tr.get('duration_covered_min', '')} min"),
+        ("Loops Removed",            tr.get("loops_removed", 0)),
+        ("Micro-segs Merged",        tr.get("micro_segs_merged", 0)),
     ]
     for k, v in tr_fields:
         add_kv_row(tr_table, k, v)

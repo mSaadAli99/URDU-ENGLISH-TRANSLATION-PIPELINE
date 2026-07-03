@@ -20,11 +20,13 @@ STAGE6_DIR = os.path.join(OUTPUT_DIR, "6_final_dataset")
 
 # ── Stage 1: ASR Model ───────────────────────────────────────
 WHISPER_MODEL        = "large-v3-turbo"   # openai/whisper-large-v3-turbo via faster-whisper
-# None = auto-detect language per segment (correct for code-switched Urdu/English interviews)
-# Set to "ur" only if the entire audio is Urdu with no English
-WHISPER_LANGUAGE     = None
-# Neutral prompt for mixed interviews — does NOT bias toward one language
-WHISPER_INITIAL_PROMPT = "This is a research interview. The speakers may use both Urdu and English."
+# None = auto-detect + two-pass ASR (code-switched Urdu/English interviews)
+# "ur"  = force Urdu — transcribe in Urdu script (disables two-pass)
+WHISPER_LANGUAGE     = "ur"
+WHISPER_INITIAL_PROMPT = (
+    "یہ ایک انٹرویو ہے۔ اردو میں اردو رسم الخط میں لکھیں۔ "
+    "This is an interview. Transcribe Urdu speech in Urdu Arabic script."
+)
 # Temperature fallback list: Whisper retries at higher temperatures when a segment scores poorly.
 # 0.0 (greedy) is tried first; if compression_ratio or log_prob is bad, it falls back in order.
 WHISPER_TEMPERATURE  = [0.0, 0.2, 0.4, 0.6]
@@ -51,7 +53,8 @@ REPETITION_MAX_CONSECUTIVE = 3   # Flag a segment if same text appeared N+ times
 # ── Stage 1: Two-pass ASR (code-switched Urdu/English) ───────
 # Pass 1: auto-detect on full audio. Pass 2: re-transcribe doubtful segments
 # with language="ur" or language="en". Only applies when WHISPER_LANGUAGE is None.
-WHISPER_TWO_PASS = True
+# Only applies when WHISPER_LANGUAGE is None (auto-detect mode).
+WHISPER_TWO_PASS = False
 WHISPER_PASS2_PROMPT_UR = (
     "Transcribe spoken Urdu in Urdu script using Arabic letters."
 )
